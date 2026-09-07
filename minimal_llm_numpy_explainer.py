@@ -296,7 +296,7 @@ def _(math, np):
         ids = list(prompt_ids)
         for _ in range(max_new):
             _probs = next_probs(p, ids, n_head, block_size, temperature)
-            nxt = int(np.random.choice(len(probs), p=probs))
+            nxt = int(np.random.choice(len(_probs), p=_probs))
             if nxt == bos:
                 break
             ids.append(nxt)
@@ -379,7 +379,7 @@ machine learning is fun
     n_embd_sl = mo.ui.slider(8, 64, step=8, value=16, label="embedding size")
     n_head_sl = mo.ui.slider(1, 8, step=1, value=4, label="attention heads")
     n_layer_sl = mo.ui.slider(1, 4, step=1, value=1, label="transformer layers")
-    block_sl = mo.ui.slider(8, 64, step=8, value=16, label="context / block size")
+    block_sl = mo.ui.slider(8, 64, step=8, value=32, label="context / block size")
 
     lr_sl = mo.ui.slider(1, 50, step=1, value=10, label="learning rate (× 1e-3)")
     steps_sl = mo.ui.slider(10, 500, step=10, value=100, label="steps per click")
@@ -581,6 +581,8 @@ def _(get_st, math, mo, np, plt):
 
     if not _losses:
         mo.md("*(loss curve appears here after training)*")
+    elif _st["tok"] is None:
+        mo.md("*(initialize the model first)*")
     else:
         _fig, _ax = plt.subplots(figsize=(9, 3))
         _ax.plot(_losses, lw=0.7, label="loss")
@@ -600,7 +602,7 @@ def _(get_st, math, mo, np, plt):
         _ax.set(
             xlabel="training step",
             ylabel="cross-entropy",
-            title=f"step {_st["step"]} | last {_losses[-1]:.4f} | min {min(_losses):.4f}",
+            title=f"step {_st['step']} | last {_losses[-1]:.4f} | min {min(_losses):.4f}",
         )
         _ax.legend(fontsize=8)
         _ax.grid(True, alpha=0.2)
@@ -613,7 +615,7 @@ def _(get_st, mo, next_probs, np, plt, prompt_in, temp_sl):
     _st = get_st()
 
     mo.stop(
-        _st["params"] is None,
+        _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
         mo.md("*(initialize the model to inspect next-character probabilities)*"),
     )
 
@@ -664,7 +666,7 @@ def _(
 
     _st = get_st()
     mo.stop(
-        _st["params"] is not None,
+        _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
         mo.callout("Initialize the model first.", kind="danger"),
     )
 
