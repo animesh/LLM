@@ -12,352 +12,247 @@ def _():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
     return math, mo, np, plt
 
 
 @app.cell
 def _(mo):
-    # One persistent state object.  Keep this in one cell so Initialize and
-    # Train always operate on the same model.
     get_st, set_st = mo.state({
-        "params": None,
-        "adam": None,
-        "step": 0,
-        "losses": [],
-        "tok": None,       # (char -> id, id -> char, BOS, vocabulary size)
-        "cfg": None,       # (embedding, heads, layers, block size)
+        "params": None, "adam": None, "step": 0, "losses": [],
+        "tok": None, "cfg": None,
+        "last_init_click": 0,
+        "last_train_click": 0,
     })
     return get_st, set_st
 
 
 @app.cell
 def _(math, np):
-    # -------------------------------------------------------------------------
-    # Helpers
-    # -------------------------------------------------------------------------
     def softmax(x, ax=-1):
-        x = x - x.max(axis=ax, keepdims=True)
+        x = x - np.max(x, axis=ax, keepdims=True)
         e = np.exp(x)
-        return e / e.sum(axis=ax, keepdims=True)
-
+        return e / np.sum(e, axis=ax, keepdims=True)
 
     def rmsnorm(x, eps=1e-5):
-        return x * (np.mean(x**2, axis=-1, keepdims=True) + eps) ** -0.5
-
+        return x * (np.mean(x * x, axis=-1, keepdims=True) + eps) ** -0.5
 
     def rmsnorm_backward(dy, x, eps=1e-5):
-        s = (np.mean(x**2, axis=-1, keepdims=True) + eps) ** -0.5
-        return s * (dy - x * s**2 * np.mean(dy * x, axis=-1, keepdims=True))
+        s = (np.mean(x * x, axis=-1, keepdims=True) + eps) ** -0.5
+        return s * (dy - x * s * s * np.mean(dy * x, axis=-1, keepdims=True))
 
-
-    # -------------------------------------------------------------------------
-    # Character tokenizer
-    # -------------------------------------------------------------------------
     def tokenize(docs):
         chars = sorted(set("".join(docs)))
         bos = len(chars)
-        c2i = {c: i for i, c in enumerate(chars)}
-        i2c = {i: c for i, c in enumerate(chars)}
-        return c2i, i2c, bos, len(chars) + 1
+        c2i = {c:i for i,c in enumerate(chars)}
+        i2c = {i:c for i,c in enumerate(chars)}
+        return c2i, i2c, bos, len(chars)+1
 
-
-    # -------------------------------------------------------------------------
-    # Model initialization
-    # -------------------------------------------------------------------------
     def init_model(vocab, n_embd, n_head, n_layer, block_size, seed=42):
         rng = np.random.default_rng(seed)
-
-        def g(rows, cols):
-            return rng.normal(0, 0.08, (rows, cols))
-
-        p = {
-            "wte": g(vocab, n_embd),
-            "wpe": g(block_size, n_embd),
-            "lm_head": g(vocab, n_embd),
-        }
-
+        def g(r,c): return rng.normal(0, 0.08, (r,c))
+        p = {"wte":g(vocab,n_embd), "wpe":g(block_size,n_embd), "lm_head":g(vocab,n_embd)}
         for li in range(n_layer):
-            for name in ("wq", "wk", "wv", "wo"):
-                p[f"l{li}.{name}"] = g(n_embd, n_embd)
-            p[f"l{li}.w1"] = g(4 * n_embd, n_embd)
-            p[f"l{li}.w2"] = g(n_embd, 4 * n_embd)
-
+            for name in ("wq","wk","wv","wo"):
+                p[f"l{li}.{name}"] = g(n_embd,n_embd)
+            p[f"l{li}.w1"] = g(4*n_embd,n_embd)
+            p[f"l{li}.w2"] = g(n_embd,4*n_embd)
         return p
 
-
     def adam_init(p):
-        return {k: [np.zeros_like(v), np.zeros_like(v)] for k, v in p.items()}
+        return {k:[np.zeros_like(v),np.zeros_like(v)] for k,v in p.items()}
 
-
-    # -------------------------------------------------------------------------
-    # Forward pass
-    # -------------------------------------------------------------------------
-    def forward(tokens, p, n_head):
-        inp = np.asarray(tokens[:-1], dtype=np.int32)
-        tgt = np.asarray(tokens[1:], dtype=np.int32)
-        T = len(inp)
-        n_embd = p["wte"].shape[1]
-        head_dim = n_embd // n_head
-        n_layer = sum(k.endswith(".wq") for k in p)
-
-        if T < 1 or T > p["wpe"].shape[0]:
-            return None, None
-
-        # token embedding + position embedding
-        xp = p["wte"][inp] + p["wpe"][:T]
-        x = rmsnorm(xp)
-
-        caches = []
-
-        for li in range(n_layer):
-            c = {"xi": x}
-
-            # ---------------- attention ----------------
-            xn = rmsnorm(x)
-            Q = xn @ p[f"l{li}.wq"].T
-            K = xn @ p[f"l{li}.wk"].T
-            V = xn @ p[f"l{li}.wv"].T
-
-            Qh = Q.reshape(T, n_head, head_dim).transpose(1, 0, 2)
-            Kh = K.reshape(T, n_head, head_dim).transpose(1, 0, 2)
-            Vh = V.reshape(T, n_head, head_dim).transpose(1, 0, 2)
-
-            scores = Qh @ Kh.transpose(0, 2, 1) / math.sqrt(head_dim)
-            mask = np.triu(np.ones((T, T), dtype=bool), 1)[None]
-            scores = np.where(mask, -1e9, scores)
-            attn = softmax(scores)
-
-            attended = (attn @ Vh).transpose(1, 0, 2).reshape(T, n_embd)
-            x = x + attended @ p[f"l{li}.wo"].T
-
-            # ---------------- MLP ----------------
-            xim = x
-            xnm = rmsnorm(x)
-            h1 = xnm @ p[f"l{li}.w1"].T
-            h = np.maximum(0, h1)
-            x = x + h @ p[f"l{li}.w2"].T
-
+    def forward(tokens,p,n_head):
+        inp=np.asarray(tokens[:-1],dtype=np.int32)
+        tgt=np.asarray(tokens[1:],dtype=np.int32)
+        T=len(inp); E=p["wte"].shape[1]; D=E//n_head
+        L=sum(k.endswith(".wq") for k in p)
+        if T<1 or T>p["wpe"].shape[0]:
+            return None,None
+        xp=p["wte"][inp]+p["wpe"][:T]
+        x=rmsnorm(xp)
+        caches=[]
+        for li in range(L):
+            c={"xi":x}
+            xn=rmsnorm(x)
+            Q=xn@p[f"l{li}.wq"].T
+            K=xn@p[f"l{li}.wk"].T
+            V=xn@p[f"l{li}.wv"].T
+            Qh=Q.reshape(T,n_head,D).transpose(1,0,2)
+            Kh=K.reshape(T,n_head,D).transpose(1,0,2)
+            Vh=V.reshape(T,n_head,D).transpose(1,0,2)
+            scores=Qh@Kh.transpose(0,2,1)/math.sqrt(D)
+            mask=np.triu(np.ones((T,T),dtype=bool),1)[None]
+            scores=np.where(mask,-1e9,scores)
+            attn=softmax(scores)
+            attended=(attn@Vh).transpose(1,0,2).reshape(T,E)
+            x=x+attended@p[f"l{li}.wo"].T
+            xim=x
+            xnm=rmsnorm(x)
+            h1=xnm@p[f"l{li}.w1"].T
+            h=np.maximum(0,h1)
+            x=x+h@p[f"l{li}.w2"].T
             c.update({
-                "xna": xn,
-                "Qh": Qh, "Kh": Kh, "Vh": Vh,
-                "attn": attn, "attended": attended,
-                "xim": xim, "xnm": xnm,
-                "h1": h1, "h": h,
+                "xna":xn,"Qh":Qh,"Kh":Kh,"Vh":Vh,
+                "attn":attn,"attended":attended,
+                "xim":xim,"xnm":xnm,"h1":h1,"h":h
             })
             caches.append(c)
-
-        logits = x @ p["lm_head"].T
-        probs = softmax(logits)
-        loss = -np.mean(np.log(probs[np.arange(T), tgt] + 1e-12))
-
-        cache = {
-            "inp": inp, "tgt": tgt, "T": T,
-            "n_head": n_head, "head_dim": head_dim,
-            "xp": xp, "xf": x, "probs": probs,
-            "layers": caches,
+        logits=x@p["lm_head"].T
+        probs=softmax(logits)
+        loss=-np.mean(np.log(probs[np.arange(T),tgt]+1e-12))
+        return loss,{
+            "inp":inp,"tgt":tgt,"T":T,
+            "n_head":n_head,"head_dim":D,
+            "xp":xp,"xf":x,"probs":probs,"layers":caches
         }
-        return loss, cache
 
+    def backward(p,c):
+        T,H,D=c["T"],c["n_head"],c["head_dim"]
+        inp,tgt=c["inp"],c["tgt"]
+        g={k:np.zeros_like(v) for k,v in p.items()}
+        dl=c["probs"].copy()
+        dl[np.arange(T),tgt]-=1
+        dl/=T
+        g["lm_head"]+=dl.T@c["xf"]
+        dx=dl@p["lm_head"]
 
-    # -------------------------------------------------------------------------
-    # Explicit backpropagation
-    # -------------------------------------------------------------------------
-    def backward(p, c):
-        T = c["T"]
-        n_head = c["n_head"]
-        head_dim = c["head_dim"]
-        n_layer = len(c["layers"])
-        inp, tgt = c["inp"], c["tgt"]
+        for li in reversed(range(len(c["layers"]))):
+            z=c["layers"][li]
 
-        g = {k: np.zeros_like(v) for k, v in p.items()}
+            g[f"l{li}.w2"]+=dx.T@z["h"]
+            dh=dx@p[f"l{li}.w2"]
+            dh1=dh*(z["h1"]>0)
+            g[f"l{li}.w1"]+=dh1.T@z["xnm"]
+            dx=dx+rmsnorm_backward(dh1@p[f"l{li}.w1"],z["xim"])
 
-        # softmax + cross entropy
-        dlogits = c["probs"].copy()
-        dlogits[np.arange(T), tgt] -= 1
-        dlogits /= T
+            g[f"l{li}.wo"]+=dx.T@z["attended"]
+            da=dx@p[f"l{li}.wo"]
+            dah=da.reshape(T,H,D).transpose(1,0,2)
+            dVh=z["attn"].transpose(0,2,1)@dah
+            datt=dah@z["Vh"].transpose(0,2,1)
 
-        g["lm_head"] += dlogits.T @ c["xf"]
-        dx = dlogits @ p["lm_head"]
+            ds=z["attn"]*(datt-(datt*z["attn"]).sum(-1,keepdims=True))
+            mask=np.triu(np.ones((T,T),dtype=bool),1)[None]
+            ds=np.where(mask,0.0,ds)/math.sqrt(D)
 
-        for li in reversed(range(n_layer)):
-            lc = c["layers"][li]
+            dQh=ds@z["Kh"]
+            dKh=ds.transpose(0,2,1)@z["Qh"]
 
-            # ================================================================
-            # MLP backward
-            # ================================================================
-            g[f"l{li}.w2"] += dx.T @ lc["h"]
-            dh = dx @ p[f"l{li}.w2"]
-            dh1 = dh * (lc["h1"] > 0)
-            g[f"l{li}.w1"] += dh1.T @ lc["xnm"]
-            dxnm = dh1 @ p[f"l{li}.w1"]
+            dQ=dQh.transpose(1,0,2).reshape(T,-1)
+            dK=dKh.transpose(1,0,2).reshape(T,-1)
+            dV=dVh.transpose(1,0,2).reshape(T,-1)
 
-            # residual path + normalized path
-            dx = dx + rmsnorm_backward(dxnm, lc["xim"])
+            g[f"l{li}.wq"]+=dQ.T@z["xna"]
+            g[f"l{li}.wk"]+=dK.T@z["xna"]
+            g[f"l{li}.wv"]+=dV.T@z["xna"]
 
-            # ================================================================
-            # Attention backward
-            # ================================================================
-            g[f"l{li}.wo"] += dx.T @ lc["attended"]
-            dattended = dx @ p[f"l{li}.wo"]
-
-            dah = dattended.reshape(T, n_head, head_dim).transpose(1, 0, 2)
-            dVh = lc["attn"].transpose(0, 2, 1) @ dah
-            datt = dah @ lc["Vh"].transpose(0, 2, 1)
-
-            # softmax Jacobian-vector product
-            dscores = lc["attn"] * (
-                datt - (datt * lc["attn"]).sum(-1, keepdims=True)
+            dxna=(
+                dQ@p[f"l{li}.wq"]+
+                dK@p[f"l{li}.wk"]+
+                dV@p[f"l{li}.wv"]
             )
+            dx=dx+rmsnorm_backward(dxna,z["xi"])
 
-            mask = np.triu(np.ones((T, T), dtype=bool), 1)[None]
-            dscores = np.where(mask, 0.0, dscores) / math.sqrt(head_dim)
-
-            dQh = dscores @ lc["Kh"]
-            dKh = dscores.transpose(0, 2, 1) @ lc["Qh"]
-
-            dQ = dQh.transpose(1, 0, 2).reshape(T, -1)
-            dK = dKh.transpose(1, 0, 2).reshape(T, -1)
-            dV = dVh.transpose(1, 0, 2).reshape(T, -1)
-
-            g[f"l{li}.wq"] += dQ.T @ lc["xna"]
-            g[f"l{li}.wk"] += dK.T @ lc["xna"]
-            g[f"l{li}.wv"] += dV.T @ lc["xna"]
-
-            dxna = (
-                dQ @ p[f"l{li}.wq"]
-                + dK @ p[f"l{li}.wk"]
-                + dV @ p[f"l{li}.wv"]
-            )
-
-            dx = dx + rmsnorm_backward(dxna, lc["xi"])
-
-        # embeddings
-        dxp = rmsnorm_backward(dx, c["xp"])
-        np.add.at(g["wte"], inp, dxp)
-        g["wpe"][:T] += dxp
-
+        dxp=rmsnorm_backward(dx,c["xp"])
+        np.add.at(g["wte"],inp,dxp)
+        g["wpe"][:T]+=dxp
         return g
 
-
-    # -------------------------------------------------------------------------
-    # Adam
-    # -------------------------------------------------------------------------
-    def adam_step(p, grads, state, step, lr, beta1=0.85, beta2=0.99, eps=1e-8):
+    def adam_step(p,g,state,step,lr,beta1=.85,beta2=.99,eps=1e-8):
         for k in p:
-            m, v = state[k]
-            m = beta1 * m + (1 - beta1) * grads[k]
-            v = beta2 * v + (1 - beta2) * grads[k] ** 2
+            m,v=state[k]
+            m=beta1*m+(1-beta1)*g[k]
+            v=beta2*v+(1-beta2)*g[k]**2
+            mh=m/(1-beta1**(step+1))
+            vh=v/(1-beta2**(step+1))
+            p[k]-=lr*mh/(np.sqrt(vh)+eps)
+            state[k]=[m,v]
+        return p,state
 
-            mh = m / (1 - beta1 ** (step + 1))
-            vh = v / (1 - beta2 ** (step + 1))
+    def explain_forward(p,ids,n_head,block_size,temperature=1.0):
+        ids=list(ids[-block_size:])
+        T=len(ids)
+        E=p["wte"].shape[1]
+        D=E//n_head
+        L=sum(k.endswith(".wq") for k in p)
 
-            p[k] -= lr * mh / (np.sqrt(vh) + eps)
-            state[k] = [m, v]
+        x0=p["wte"][ids]+p["wpe"][:T]
+        x=rmsnorm(x0)
+        layers=[]
 
-        return p, state
+        for li in range(L):
+            x_in=x.copy()
+            xn=rmsnorm(x)
+            Q=xn@p[f"l{li}.wq"].T
+            K=xn@p[f"l{li}.wk"].T
+            V=xn@p[f"l{li}.wv"].T
 
+            Qh=Q.reshape(T,n_head,D).transpose(1,0,2)
+            Kh=K.reshape(T,n_head,D).transpose(1,0,2)
+            Vh=V.reshape(T,n_head,D).transpose(1,0,2)
 
-    # -------------------------------------------------------------------------
-    # Inference
-    # -------------------------------------------------------------------------
-    def next_probs(p, ids, n_head, block_size, temperature):
-        ids = list(ids[-block_size:])
-        T = len(ids)
-        n_embd = p["wte"].shape[1]
-        head_dim = n_embd // n_head
-        n_layer = sum(k.endswith(".wq") for k in p)
+            scores=Qh@Kh.transpose(0,2,1)/math.sqrt(D)
+            mask=np.triu(np.ones((T,T),dtype=bool),1)[None]
+            scores=np.where(mask,-1e9,scores)
+            attn=softmax(scores)
 
-        x = rmsnorm(p["wte"][ids] + p["wpe"][:T])
+            attended=(attn@Vh).transpose(1,0,2).reshape(T,E)
+            x_attn=x+attended@p[f"l{li}.wo"].T
 
-        for li in range(n_layer):
-            xn = rmsnorm(x)
-            Q = xn @ p[f"l{li}.wq"].T
-            K = xn @ p[f"l{li}.wk"].T
-            V = xn @ p[f"l{li}.wv"].T
+            xnm=rmsnorm(x_attn)
+            h1=xnm@p[f"l{li}.w1"].T
+            h=np.maximum(0,h1)
+            x=x_attn+h@p[f"l{li}.w2"].T
 
-            Qh = Q.reshape(T, n_head, head_dim).transpose(1, 0, 2)
-            Kh = K.reshape(T, n_head, head_dim).transpose(1, 0, 2)
-            Vh = V.reshape(T, n_head, head_dim).transpose(1, 0, 2)
+            layers.append({
+                "x_in":x_in,"xn":xn,"Q":Qh,"K":Kh,"V":Vh,
+                "scores":scores,"attn":attn,"attended":attended,
+                "x_attn":x_attn,"h1":h1,"h":h,"x_out":x
+            })
 
-            scores = Qh @ Kh.transpose(0, 2, 1) / math.sqrt(head_dim)
-            mask = np.triu(np.ones((T, T), dtype=bool), 1)[None]
-            scores = np.where(mask, -1e9, scores)
-            attn = softmax(scores)
+        logits=x[-1]@p["lm_head"].T
+        probs=softmax(logits/max(temperature,.01))
+        return {
+            "ids":ids,"embedding":x0,"layers":layers,
+            "final":x,"logits":logits,"probs":probs
+        }
 
-            attended = (attn @ Vh).transpose(1, 0, 2).reshape(T, n_embd)
-            x = x + attended @ p[f"l{li}.wo"].T
-            x = x + np.maximum(0, rmsnorm(x) @ p[f"l{li}.w1"].T) @ p[f"l{li}.w2"].T
+    def next_probs(p,ids,n_head,block_size,temperature):
+        return explain_forward(
+            p,ids,n_head,block_size,temperature
+        )["probs"]
 
-        return softmax(x[-1] @ p["lm_head"].T / max(temperature, 0.01))
-
-
-    def generate(p, prompt_ids, bos, i2c, n_head, block_size, max_new, temperature):
-        ids = list(prompt_ids)
+    def generate(p,prompt_ids,bos,i2c,n_head,block_size,max_new,temperature):
+        ids=list(prompt_ids)
         for _ in range(max_new):
-            _probs = next_probs(p, ids, n_head, block_size, temperature)
-            nxt = int(np.random.choice(len(_probs), p=_probs))
-            if nxt == bos:
+            probs=next_probs(p,ids,n_head,block_size,temperature)
+            nxt=int(np.random.choice(len(probs),p=probs))
+            if nxt==bos:
                 break
             ids.append(nxt)
-
-        return "".join(i2c.get(t, "") for t in ids[len(prompt_ids):])
-
+        return "".join(i2c.get(t,"") for t in ids[len(prompt_ids):])
 
     return (
-        adam_init,
-        adam_step,
-        backward,
-        forward,
-        generate,
-        init_model,
-        next_probs,
-        tokenize,
+        adam_init,adam_step,backward,forward,generate,
+        explain_forward,init_model,next_probs,tokenize
     )
 
 
 @app.cell
 def _(mo):
-    mo.md(r"""
-    # Minimal LLM -- NumPy
+    mo.md("""# Minimal LLM -- NumPy
 
-    This notebook starts from the small `ann_numpy.py` and adds the pieces one
-    at a time.
+This starts from `ann_numpy.py` and makes the Transformer visible.
 
-    ```text
-    ann_numpy.py
+`character → embedding → attention → MLP → next-character probability`
 
-        input → hidden → output
-
-    this model
-
-        characters → embeddings → attention → MLP → next character
-    ```
-
-    The training objective is still simple:
-
-    ```text
-    predict the next character
-    ```
-
-    With a context of 8, for example:
-
-    ```text
-    "the wor" → "l"
-    "he world" → " "
-    ```
-
-    The important conceptual change is that **attention lets every position
-    look at the preceding positions**. The causal mask prevents it from seeing
-    the future.
-
-    The backward pass is written explicitly with NumPy. There is no autograd.
-    """)
+Everything below is produced by the same small NumPy model used for training.
+There is no autograd.""")
 
 
 @app.cell
 def _(mo):
-    default_data = """hello world
+    data="""hello world
 hello there
 hello world
 how are you
@@ -368,170 +263,127 @@ we learn neural networks
 we learn machine learning
 machine learning is fun
 """
-
-    data_ta = mo.ui.text_area(
-        value=default_data,
-        label="Training data (one document per line)",
-        rows=10,
-        full_width=True,
+    expl_data=mo.ui.text_area(
+        value=data,label="Training data (one document per line)",
+        rows=8,full_width=True
     )
-
-    n_embd_sl = mo.ui.slider(8, 64, step=8, value=16, label="embedding size")
-    n_head_sl = mo.ui.slider(1, 8, step=1, value=4, label="attention heads")
-    n_layer_sl = mo.ui.slider(1, 4, step=1, value=1, label="transformer layers")
-    block_sl = mo.ui.slider(8, 64, step=8, value=32, label="context / block size")
-
-    lr_sl = mo.ui.slider(1, 50, step=1, value=10, label="learning rate (× 1e-3)")
-    steps_sl = mo.ui.slider(10, 500, step=10, value=100, label="steps per click")
-
-    prompt_in = mo.ui.text(
-        value="",
-        placeholder="leave blank = BOS",
-        label="Prompt",
-    )
-    temp_sl = mo.ui.slider(1, 20, step=1, value=5, label="temperature (× 0.1)")
-    maxnew_sl = mo.ui.slider(10, 200, step=10, value=50, label="new characters")
-
-    init_btn = mo.ui.button(label="Initialize", kind="success")
-    train_btn = mo.ui.button(label="Train", kind="warn")
-    gen_btn = mo.ui.button(label="Generate")
-
+    expl_n_embd=mo.ui.slider(8,64,step=8,value=16,label="embedding size")
+    expl_n_head=mo.ui.slider(1,8,value=4,label="attention heads")
+    expl_n_layer=mo.ui.slider(1,4,value=1,label="transformer layers")
+    expl_block=mo.ui.slider(8,64,step=8,value=32,label="context / block size")
+    expl_lr=mo.ui.slider(1,50,value=10,label="learning rate (× 1e-3)")
+    expl_steps=mo.ui.slider(10,500,step=10,value=100,label="steps per click")
+    expl_prompt=mo.ui.text(value="the wor",label="Prompt")
+    expl_temp=mo.ui.slider(1,20,value=5,label="temperature (× 0.1)")
+    expl_maxnew=mo.ui.slider(10,100,step=10,value=30,label="new characters")
+    expl_layer=mo.ui.slider(1,4,value=1,label="inspect layer")
+    expl_head=mo.ui.slider(1,8,value=1,label="inspect head")
+    expl_pos=mo.ui.slider(1,32,value=1,label="inspect token position")
+    expl_init=mo.ui.button(label="Initialize",kind="success")
+    expl_train=mo.ui.button(label="Train",kind="warn")
+    expl_generate=mo.ui.button(label="Generate")
     return (
-        block_sl,
-        data_ta,
-        gen_btn,
-        init_btn,
-        lr_sl,
-        maxnew_sl,
-        n_embd_sl,
-        n_head_sl,
-        n_layer_sl,
-        prompt_in,
-        steps_sl,
-        temp_sl,
-        train_btn,
+        expl_block,expl_data,expl_generate,expl_head,expl_init,expl_layer,
+        expl_lr,expl_maxnew,expl_n_embd,expl_n_head,expl_n_layer,expl_pos,
+        expl_prompt,expl_steps,expl_temp,expl_train
     )
 
 
 @app.cell
 def _(
-    block_sl,
-    data_ta,
-    gen_btn,
-    init_btn,
-    lr_sl,
-    maxnew_sl,
-    mo,
-    n_embd_sl,
-    n_head_sl,
-    n_layer_sl,
-    prompt_in,
-    steps_sl,
-    temp_sl,
-    train_btn,
+    expl_block,expl_data,expl_generate,expl_head,expl_init,expl_layer,
+    expl_lr,expl_maxnew,expl_n_embd,expl_n_head,expl_n_layer,expl_pos,
+    expl_prompt,expl_steps,expl_temp,expl_train,mo
 ):
-    mo.hstack([
-        mo.vstack([mo.md("### Data"), data_ta], align="start"),
-        mo.vstack([
-            mo.md("### Architecture"),
-            n_embd_sl, n_head_sl, n_layer_sl, block_sl,
-            mo.md("### Training"),
-            lr_sl, steps_sl,
-            mo.hstack([init_btn, train_btn]),
-        ], align="start"),
-        mo.vstack([
-            mo.md("### Generation"),
-            prompt_in, temp_sl, maxnew_sl, gen_btn,
-        ], align="start"),
-    ], gap=2)
+    mo.vstack([
+        mo.md("## Controls"),
+        mo.md("### 1. Training data"),
+        expl_data,
+        mo.md("### 2. Model architecture"),
+        mo.hstack([expl_n_embd, expl_n_head, expl_n_layer, expl_block], gap=1),
+        mo.md("### 3. Train"),
+        mo.hstack([expl_lr, expl_steps, expl_init, expl_train], gap=1),
+        mo.md("### 4. Try the model"),
+        mo.hstack([expl_prompt, expl_temp, expl_maxnew, expl_generate], gap=1),
+        mo.md("### 5. Inspect the Transformer"),
+        mo.hstack([expl_layer, expl_head, expl_pos], gap=1),
+    ])
 
 
+
+# State updates trigger reactive re-execution. Each button click is consumed
+# once, so the state update cannot execute the same action again.
 @app.cell
 def _(
-    data_ta,
-    get_st,
-    init_btn,
-    init_model,
-    mo,
-    n_embd_sl,
-    n_head_sl,
-    n_layer_sl,
-    block_sl,
-    set_st,
-    tokenize,
+    adam_init, expl_block, expl_data, expl_init, expl_n_embd, expl_n_head,
+    expl_n_layer, get_st, init_model, mo, set_st, tokenize
 ):
+    _st = get_st()
+    _click = expl_init.value
+
     mo.stop(
-        init_btn.value == 0,
-        mo.callout("Click **Initialize** to build the model.", kind="info"),
+        _click == 0 or _click == _st["last_init_click"],
+        None,
     )
 
-    _docs = [x.strip() for x in data_ta.value.splitlines() if x.strip()]
+    _docs = [x.strip() for x in expl_data.value.splitlines() if x.strip()]
     mo.stop(
         not _docs,
         mo.callout("Enter at least one training document.", kind="danger"),
     )
 
     _c2i, _i2c, _bos, _vocab = tokenize(_docs)
+    _H = expl_n_head.value
+    _E = (expl_n_embd.value // _H) * _H
+    _L = expl_n_layer.value
+    _B = expl_block.value
+    _longest = max(len(x) for x in _docs)
 
-    _n_head = n_head_sl.value
-    _n_embd = (n_embd_sl.value // _n_head) * _n_head
-    _n_layer = n_layer_sl.value
-    _block = block_sl.value
+    mo.stop(
+        _longest + 1 > _B,
+        mo.callout(
+            f"Longest document has {_longest} characters. "
+            f"Increase block size to at least {_longest + 1}.",
+            kind="danger",
+        ),
+    )
 
-    # Each document contributes BOS + characters + BOS, so block must be
-    # large enough to contain at least one prediction target.
-    if max(len(d) for d in _docs) + 1 > _block:
-        _longest = max(len(d) for d in _docs)
-        mo.stop(
-            True,
-            mo.callout(
-                f"Longest document has {_longest} characters. "
-                f"Increase block size to at least {_longest + 1}.",
-                kind="danger",
-            ),
-        )
-
-    _params = init_model(_vocab, _n_embd, _n_head, _n_layer, _block)
-    _adam = adam_init(_params)
-    _n_params = sum(v.size for v in _params.values())
+    _p = init_model(_vocab, _E, _H, _L, _B)
+    _adam = adam_init(_p)
 
     set_st({
-        "params": _params,
+        **_st,
+        "params": _p,
         "adam": _adam,
         "step": 0,
         "losses": [],
         "tok": (_c2i, _i2c, _bos, _vocab),
-        "cfg": (_n_embd, _n_head, _n_layer, _block),
+        "cfg": (_E, _H, _L, _B),
+        "last_init_click": _click,
     })
 
     mo.callout(
-        f"**Ready.** vocab {_vocab} | embedding {_n_embd} | heads {_n_head} | "
-        f"layers {_n_layer} | block {_block} | **{_n_params:,} parameters**",
+        f"Ready. {_vocab} characters | {_E} embedding | "
+        f"{_H} heads | {_L} layer(s) | {_B} context",
         kind="success",
     )
 
 
 @app.cell
 def _(
-    adam_step,
-    backward,
-    data_ta,
-    forward,
-    get_st,
-    lr_sl,
-    mo,
-    set_st,
-    steps_sl,
-    train_btn,
+    adam_step, backward, expl_data, expl_lr, expl_steps, expl_train,
+    forward, get_st, mo, set_st
 ):
+    _st = get_st()
+    _click = expl_train.value
+
     mo.stop(
-        train_btn.value == 0,
-        mo.callout("Click **Train** to run gradient steps.", kind="info"),
+        _click == 0 or _click == _st["last_train_click"],
+        None,
     )
 
-    _st = get_st()
     mo.stop(
-        _st["params"] is None,
+        _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
         mo.callout("Initialize the model first.", kind="danger"),
     )
 
@@ -539,210 +391,435 @@ def _(
     _adam = {k: [m.copy(), v.copy()] for k, (m, v) in _st["adam"].items()}
     _step = _st["step"]
     _losses = list(_st["losses"])
-
     _c2i, _i2c, _bos, _vocab = _st["tok"]
-    _n_embd, _n_head, _n_layer, _block = _st["cfg"]
-    _docs = [x.strip() for x in data_ta.value.splitlines() if x.strip()]
+    _E, _H, _L, _B = _st["cfg"]
+    _docs = [x.strip() for x in expl_data.value.splitlines() if x.strip()]
 
-    _lr = lr_sl.value * 1e-3
-    _n_steps = steps_sl.value
+    mo.stop(
+        not _docs,
+        mo.callout("Enter at least one training document.", kind="danger"),
+    )
 
-    for _local_step in range(_n_steps):
-        _doc = _docs[(_step + _local_step) % len(_docs)]
+    _unknown = sorted(
+        set(c for _doc in _docs for c in _doc if c not in _c2i)
+    )
+    mo.stop(
+        _unknown,
+        mo.callout(
+            f"Training data contains character(s) not in the initialized "
+            f"vocabulary: {_unknown}. Click **Initialize** again.",
+            kind="danger",
+        ),
+    )
+
+    for _local in range(expl_steps.value):
+        _doc = _docs[(_step + _local) % len(_docs)]
         _tokens = [_bos] + [_c2i[c] for c in _doc] + [_bos]
+        _loss, _cache = forward(_tokens, _p, _H)
 
-        _loss, _cache = forward(_tokens, _p, _n_head)
-        if _cache is None:
-            continue
+        if _cache is not None:
+            _grads = backward(_p, _cache)
+            _p, _adam = adam_step(
+                _p, _grads, _adam, _step + _local, expl_lr.value * 1e-3
+            )
+            _losses.append(float(_loss))
 
-        _grads = backward(_p, _cache)
-        _p, _adam = adam_step(_p, _grads, _adam, _step + _local_step, _lr)
-        _losses.append(float(_loss))
+    _new_step = _step + expl_steps.value
 
     set_st({
         **_st,
         "params": _p,
         "adam": _adam,
-        "step": _step + _n_steps,
+        "step": _new_step,
         "losses": _losses,
+        "last_train_click": _click,
     })
 
     mo.callout(
-        f"Trained **{_n_steps}** steps | total **{_step + _n_steps}** | "
-        f"loss **{_losses[-1]:.4f}**",
+        f"Trained {_new_step} steps | loss {_losses[-1]:.4f}",
         kind="success",
     )
 
 
 @app.cell
-def _(get_st, math, mo, np, plt):
-    _st = get_st()
-    _losses = _st["losses"]
-
-    if not _losses:
-        mo.md("*(loss curve appears here after training)*")
-    elif _st["tok"] is None:
-        mo.md("*(initialize the model first)*")
-    else:
-        _fig, _ax = plt.subplots(figsize=(9, 3))
-        _ax.plot(_losses, lw=0.7, label="loss")
-
-        if len(_losses) >= 25:
-            _ma = np.convolve(_losses, np.ones(25) / 25, mode="valid")
-            _ax.plot(range(24, len(_losses)), _ma, lw=1.8, label="moving average")
-
-        _vocab = _st["tok"][3]
-        _ax.axhline(
-            math.log(_vocab),
-            lw=0.8,
-            ls="--",
-            label=f"uniform prediction = log({_vocab})",
-        )
-
-        _ax.set(
-            xlabel="training step",
-            ylabel="cross-entropy",
-            title=f"step {_st['step']} | last {_losses[-1]:.4f} | min {min(_losses):.4f}",
-        )
-        _ax.legend(fontsize=8)
-        _ax.grid(True, alpha=0.2)
-        plt.tight_layout()
-        _fig
-
-
-@app.cell
-def _(get_st, mo, next_probs, np, plt, prompt_in, temp_sl):
+def _(expl_prompt, expl_temp, get_st, mo, next_probs, np):
     _st = get_st()
 
     mo.stop(
         _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
-        mo.md("*(initialize the model to inspect next-character probabilities)*"),
+        mo.md("Initialize the model to inspect next-character probabilities."),
     )
 
     _c2i, _i2c, _bos, _vocab = _st["tok"]
-    _n_embd, _n_head, _n_layer, _block = _st["cfg"]
-    _prompt = prompt_in.value
+    _E, _H, _L, _B = _st["cfg"]
+    _unknown = sorted(
+        set(c for c in expl_prompt.value if c not in _c2i)
+    )
 
+    mo.stop(
+        _unknown,
+        mo.callout(f"Unknown character(s): {_unknown}", kind="danger"),
+    )
+
+    _ids = (
+        [_bos] + [_c2i[c] for c in expl_prompt.value]
+        if expl_prompt.value
+        else [_bos]
+    )
+    _probs = next_probs(
+        _st["params"], _ids, _H, _B, expl_temp.value * 0.1
+    )
+    _order = np.argsort(_probs)[::-1][:min(12, _vocab)]
+
+    mo.md(
+        "### Next-character prediction\n\n"
+        + "\n".join(
+            f"`{_i2c.get(int(i), '<BOS>')}` — **{_probs[i]:.3f}**"
+            for i in _order
+        )
+    )
+
+
+@app.cell
+def _(
+    explain_forward, expl_head, expl_layer, expl_pos, expl_prompt, expl_temp,
+    get_st, mo, np
+):
+    _st = get_st()
+
+    mo.stop(
+        _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
+        mo.md("Initialize the model to see the Transformer."),
+    )
+
+    _c2i, _i2c, _bos, _vocab = _st["tok"]
+    _E, _H, _L, _B = _st["cfg"]
+    _prompt = expl_prompt.value
     _unknown = sorted(set(c for c in _prompt if c not in _c2i))
+
     mo.stop(
         _unknown,
         mo.callout(f"Unknown character(s): {_unknown}", kind="danger"),
     )
 
     _ids = [_bos] + [_c2i[c] for c in _prompt] if _prompt else [_bos]
-    _probs = next_probs(
-        _st["params"], _ids, _n_head, _block, temp_sl.value * 0.1
+    _tr = explain_forward(
+        _st["params"], _ids, _H, _B, expl_temp.value * 0.1
     )
 
-    _order = np.argsort(_probs)[::-1][:min(12, _vocab)]
-    _labels = [repr(_i2c.get(int(i), "<BOS>")) for i in _order]
+    _T = len(_tr["ids"])
+    _layer = min(expl_layer.value - 1, _L - 1)
+    _head = min(expl_head.value - 1, _H - 1)
+    _pos = min(expl_pos.value - 1, _T - 1)
 
-    _fig, _ax = plt.subplots(figsize=(9, 3))
-    _ax.bar(_labels, _probs[_order])
-    _ax.set(
-        xlabel="next token",
-        ylabel="probability",
-        title=f"P(next character | `{_prompt or '<BOS>'}`)",
+    _tokens = [
+        "<BOS>" if i == _bos else _i2c.get(i, "?")
+        for i in _tr["ids"]
+    ]
+
+    _row = _tr["layers"][_layer]["attn"][_head, _pos]
+    _top = np.argsort(_row)[::-1][:min(5, _T)]
+    _attention_text = "\n".join(
+        f"`{_tokens[i]}`  {_row[i]:.3f}" for i in _top
     )
-    _ax.grid(True, axis="y", alpha=0.2)
-    plt.tight_layout()
+
+    _h = _tr["layers"][_layer]["h"][_pos]
+    _active = np.where(_h > 0)[0]
+    _top_neurons = (
+        _active[np.argsort(_h[_active])[::-1][:10]]
+        if len(_active)
+        else []
+    )
+    _mlp_text = (
+        "\n".join(
+            f"neuron {int(i)}  {_h[i]:.3f}" for i in _top_neurons
+        )
+        or "no active ReLU neurons"
+    )
+
+    _out = np.argsort(_tr["probs"])[::-1][:min(8, _vocab)]
+    _output_text = "\n".join(
+        f"`{_i2c.get(int(i), '<BOS>')}`  **{_tr['probs'][i]:.3f}**"
+        for i in _out
+    )
+
+    mo.vstack([
+        mo.md(f"""### Transformer flow
+
+**Input** `{''.join(_tokens)}`
+
+```text
+token IDs
+    ↓
+token + position embedding   {_T} × {_E}
+    ↓
+Transformer block {_layer + 1}
+    ├── self-attention: {_H} heads
+    └── MLP: {_E} → {4 * _E} → {_E}
+    ↓
+final representation → logits → softmax → next character
+```"""),
+        mo.hstack([
+            mo.callout(
+                mo.md(
+                    f"### Attention\n"
+                    f"Layer {_layer + 1}, head {_head + 1}, "
+                    f"position {_pos + 1}\n\n{_attention_text}"
+                ),
+                kind="info",
+            ),
+            mo.callout(
+                mo.md(f"### MLP\nTop active neurons\n\n{_mlp_text}"),
+                kind="info",
+            ),
+            mo.callout(
+                mo.md(f"### Output\n\n{_output_text}"),
+                kind="info",
+            ),
+        ], gap=1),
+    ])
+
+
+@app.cell
+def _(
+    explain_forward, expl_head, expl_layer, expl_prompt, expl_temp,
+    get_st, mo, plt
+):
+    _st = get_st()
+
+    mo.stop(
+        _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
+        mo.md("Initialize the model to see attention."),
+    )
+
+    _c2i, _i2c, _bos, _vocab = _st["tok"]
+    _E, _H, _L, _B = _st["cfg"]
+    _prompt = expl_prompt.value
+
+    mo.stop(
+        any(c not in _c2i for c in _prompt),
+        mo.md("Unknown character in prompt."),
+    )
+
+    _ids = [_bos] + [_c2i[c] for c in _prompt] if _prompt else [_bos]
+    _tr = explain_forward(
+        _st["params"], _ids, _H, _B, expl_temp.value * 0.1
+    )
+    _layer = min(expl_layer.value - 1, _L - 1)
+    _head = min(expl_head.value - 1, _H - 1)
+    _attn = _tr["layers"][_layer]["attn"][_head]
+    _tokens = [
+        "BOS" if i == _bos else _i2c.get(i, "?")
+        for i in _tr["ids"]
+    ]
+
+    _fig, _ax = plt.subplots(
+        figsize=(max(5, len(_tokens) * 0.55),
+                 max(4, len(_tokens) * 0.45))
+    )
+    _im = _ax.imshow(_attn, vmin=0, vmax=1, aspect="auto")
+    _ax.set_xticks(range(len(_tokens)), _tokens)
+    _ax.set_yticks(range(len(_tokens)), _tokens)
+    _ax.set_xlabel("keys: tokens being read")
+    _ax.set_ylabel("queries: current token")
+    _ax.set_title(
+        f"Layer {_layer + 1}, head {_head + 1}: causal self-attention"
+    )
+    _fig.colorbar(_im, ax=_ax, label="attention weight")
+    _fig.tight_layout()
+    plt.close(_fig)
+    _fig
+
+
+@app.cell
+def _(explain_forward, expl_prompt, expl_temp, get_st, mo, plt):
+    _st = get_st()
+
+    mo.stop(
+        _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
+        mo.md("Initialize the model to see embeddings."),
+    )
+
+    _c2i, _i2c, _bos, _vocab = _st["tok"]
+    _E, _H, _L, _B = _st["cfg"]
+    _prompt = expl_prompt.value
+
+    mo.stop(
+        any(c not in _c2i for c in _prompt),
+        mo.md("Unknown character in prompt."),
+    )
+
+    _ids = [_bos] + [_c2i[c] for c in _prompt] if _prompt else [_bos]
+    _tr = explain_forward(
+        _st["params"], _ids, _H, _B, expl_temp.value * 0.1
+    )
+    _tokens = [
+        "BOS" if i == _bos else _i2c.get(i, "?")
+        for i in _tr["ids"]
+    ]
+
+    _fig, _ax = plt.subplots(
+        figsize=(10, max(2.5, len(_tokens) * 0.42))
+    )
+    _im = _ax.imshow(_tr["embedding"], aspect="auto")
+    _ax.set_yticks(range(len(_tokens)), _tokens)
+    _ax.set_xlabel("embedding dimension")
+    _ax.set_ylabel("token")
+    _ax.set_title("Token + positional embedding")
+    _fig.colorbar(_im, ax=_ax, label="value")
+    _fig.tight_layout()
+    plt.close(_fig)
     _fig
 
 
 @app.cell
 def _(
-    gen_btn,
-    generate,
-    get_st,
-    maxnew_sl,
-    mo,
-    prompt_in,
-    temp_sl,
+    explain_forward, expl_head, expl_layer, expl_pos, expl_prompt,
+    expl_temp, get_st, mo, np, plt
 ):
+    _st = get_st()
+
     mo.stop(
-        gen_btn.value == 0,
-        mo.callout("Enter a prompt and click **Generate**.", kind="info"),
+        _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
+        mo.md("Initialize the model to see Q/K/V."),
     )
 
+    _c2i, _i2c, _bos, _vocab = _st["tok"]
+    _E, _H, _L, _B = _st["cfg"]
+    _prompt = expl_prompt.value
+
+    mo.stop(
+        any(c not in _c2i for c in _prompt),
+        mo.md("Unknown character in prompt."),
+    )
+
+    _ids = [_bos] + [_c2i[c] for c in _prompt] if _prompt else [_bos]
+    _tr = explain_forward(
+        _st["params"], _ids, _H, _B, expl_temp.value * 0.1
+    )
+
+    _layer = min(expl_layer.value - 1, _L - 1)
+    _head = min(expl_head.value - 1, _H - 1)
+    _pos = min(expl_pos.value - 1, len(_ids) - 1)
+
+    _q = _tr["layers"][_layer]["Q"][_head, _pos]
+    _k = _tr["layers"][_layer]["K"][_head]
+    _v = _tr["layers"][_layer]["V"][_head]
+
+    _q_norm = float(np.sqrt(np.sum(_q * _q)))
+    _k_norm = float(np.mean(np.sqrt(np.sum(_k * _k, axis=1))))
+    _v_norm = float(np.mean(np.sqrt(np.sum(_v * _v, axis=1))))
+
+    _fig, _ax = plt.subplots(figsize=(6, 3))
+    _ax.bar(["Q", "K norm", "V norm"], [_q_norm, _k_norm, _v_norm])
+    _ax.set_ylabel("vector norm")
+    _ax.set_title(
+        f"Layer {_layer + 1}, head {_head + 1}, position {_pos + 1}: Q / K / V"
+    )
+    _ax.grid(True, axis="y", alpha=.2)
+    _fig.tight_layout()
+    plt.close(_fig)
+    _fig
+
+
+@app.cell
+def _(get_st, mo, plt):
     _st = get_st()
+    _losses = _st["losses"]
+
+    if not _losses:
+        _loss_output = mo.md(
+            "### Training\nTrain the model to see the loss fall."
+        )
+    else:
+        _fig, _ax = plt.subplots(figsize=(10, 3))
+        _ax.plot(_losses, lw=.8)
+        _ax.set(
+            xlabel="training step",
+            ylabel="cross-entropy",
+            title=f"training loss | step {_st['step']}",
+        )
+        _ax.grid(True, alpha=.2)
+        _fig.tight_layout()
+        plt.close(_fig)
+        _loss_output = _fig
+
+    _loss_output
+
+
+@app.cell
+def _(
+    expl_generate, expl_maxnew, expl_prompt, expl_temp, generate,
+    get_st, mo
+):
+    _st = get_st()
+
+    mo.stop(
+        expl_generate.value == 0,
+        mo.md("Click **Generate** to sample from the trained model."),
+    )
+
     mo.stop(
         _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
         mo.callout("Initialize the model first.", kind="danger"),
     )
 
     _c2i, _i2c, _bos, _vocab = _st["tok"]
-    _n_embd, _n_head, _n_layer, _block = _st["cfg"]
-    _raw = prompt_in.value
-
+    _E, _H, _L, _B = _st["cfg"]
+    _raw = expl_prompt.value
     _unknown = sorted(set(c for c in _raw if c not in _c2i))
+
     mo.stop(
         _unknown,
         mo.callout(f"Unknown character(s): {_unknown}", kind="danger"),
     )
 
-    _prompt_ids = [_bos] + [_c2i[c] for c in _raw] if _raw else [_bos]
+    _prompt_ids = (
+        [_bos] + [_c2i[c] for c in _raw]
+        if _raw
+        else [_bos]
+    )
     _generated = generate(
         _st["params"],
         _prompt_ids,
         _bos,
         _i2c,
-        _n_head,
-        _block,
-        maxnew_sl.value,
-        temp_sl.value * 0.1,
+        _H,
+        _B,
+        expl_maxnew.value,
+        expl_temp.value * 0.1,
     )
 
-    mo.vstack([
-        mo.md(f"**Prompt:** `{_raw or '<BOS>'}`"),
-        mo.callout(mo.md(f"## `{_generated or '<nothing>'}`"), kind="info"),
-    ])
+    mo.callout(
+        mo.md(
+            f"### `{_raw or '<BOS>'}` → "
+            f"`{_generated or '<nothing>'}`"
+        ),
+        kind="success",
+    )
 
 
 @app.cell
 def _(get_st, mo):
     _st = get_st()
 
-    if _st["params"] is None:
-        mo.md("### Model anatomy\nInitialize the model to see its dimensions.")
+    if _st["params"] is None or _st["tok"] is None or _st["cfg"] is None:
+        _state_output = mo.md(
+            "### Model state\nInitialize the model to see parameter counts."
+        )
     else:
-        _n_embd, _n_head, _n_layer, _block = _st["cfg"]
-        _vocab = _st["tok"][3]
+        _n = sum(v.size for v in _st["params"].values())
+        _E, _H, _L, _B = _st["cfg"]
+        _state_output = mo.md(f"""### Model state
 
-        mo.md(f"""
-        ### Model anatomy
+**Parameters:** {_n:,}  
+**Embedding:** {_E}  
+**Heads:** {_H} × {_E // _H}  
+**Layers:** {_L}  
+**Context:** {_B}  
+**Training steps:** {_st["step"]}""")
 
-        **Vocabulary:** {_vocab} characters
-
-        **Context:** {_block} positions
-
-        **Embedding:** {_n_embd} numbers per character
-
-        **Attention:** {_n_head} heads × {_n_embd // _n_head} numbers per head
-
-        **Transformer blocks:** {_n_layer}
-
-        **Training step:** {_st["step"]}
-
-        The information flow is:
-
-        ```text
-        character IDs
-              ↓
-        token embedding + position embedding
-              ↓
-        RMSNorm
-              ↓
-        causal self-attention
-              ↓
-        residual connection
-              ↓
-        RMSNorm → linear → ReLU → linear
-              ↓
-        residual connection
-              ↓
-        next-character probabilities
-        ```
-        """)
+    _state_output
 
 
 if __name__ == "__main__":
