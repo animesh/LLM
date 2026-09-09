@@ -40,6 +40,16 @@ def _(math, np):
         s = (np.mean(x * x, axis=-1, keepdims=True) + eps) ** -0.5
         return s * (dy - x * s * s * np.mean(dy * x, axis=-1, keepdims=True))
 
+    def display_token(i, i2c, bos):
+        if i == bos:
+            return "<BOS>"
+        ch = i2c.get(i, "?")
+        if ch == " ":
+            return "<space>"
+        if ch == "\n":
+            return "<newline>"
+        return ch
+
     def tokenize(docs):
         chars = sorted(set("".join(docs)))
         bos = len(chars)
@@ -234,7 +244,7 @@ def _(math, np):
 
     return (
         adam_init,adam_step,backward,forward,generate,
-        explain_forward,init_model,next_probs,tokenize
+        explain_forward,init_model,next_probs,tokenize,display_token
     )
 
 
@@ -291,9 +301,9 @@ machine learning is fun
 
 @app.cell
 def _(
-    expl_block,expl_data,expl_generate,expl_head,expl_init,expl_layer,
-    expl_lr,expl_maxnew,expl_n_embd,expl_n_head,expl_n_layer,expl_pos,
-    expl_prompt,expl_steps,expl_temp,expl_train,mo
+    expl_block,expl_data,expl_head,expl_init,expl_layer,
+    expl_lr,expl_n_embd,expl_n_head,expl_n_layer,expl_pos,
+    expl_steps,expl_train,mo
 ):
     mo.vstack([
         mo.md("## Controls"),
@@ -303,9 +313,7 @@ def _(
         mo.hstack([expl_n_embd, expl_n_head, expl_n_layer, expl_block], gap=1),
         mo.md("### 3. Train"),
         mo.hstack([expl_lr, expl_steps, expl_init, expl_train], gap=1),
-        mo.md("### 4. Try the model"),
-        mo.hstack([expl_prompt, expl_temp, expl_maxnew, expl_generate], gap=1),
-        mo.md("### 5. Inspect the Transformer"),
+        mo.md("### 4. Inspect the Transformer"),
         mo.hstack([expl_layer, expl_head, expl_pos], gap=1),
     ])
 
@@ -442,48 +450,50 @@ def _(
 
 
 @app.cell
-def _(expl_prompt, expl_temp, get_st, mo, next_probs, np):
+def _(display_token, expl_generate, expl_maxnew, expl_prompt, expl_temp, get_st, mo, next_probs, np):
     _st = get_st()
+
+    _playground = mo.vstack([
+        mo.md("## Interactive playground"),
+        mo.md("Enter a prompt, then inspect the next-character prediction or generate text."),
+        mo.hstack([expl_prompt, expl_temp, expl_maxnew, expl_generate], gap=1),
+    ])
 
     mo.stop(
         _st["params"] is None or _st["tok"] is None or _st["cfg"] is None,
-        mo.md("Initialize the model to inspect next-character probabilities."),
+        mo.vstack([_playground, mo.md("Initialize the model to inspect next-character probabilities.")]),
     )
 
     _c2i, _i2c, _bos, _vocab = _st["tok"]
     _E, _H, _L, _B = _st["cfg"]
-    _unknown = sorted(
-        set(c for c in expl_prompt.value if c not in _c2i)
-    )
+    _unknown = sorted(set(c for c in expl_prompt.value if c not in _c2i))
 
     mo.stop(
         _unknown,
-        mo.callout(f"Unknown character(s): {_unknown}", kind="danger"),
+        mo.vstack([_playground, mo.callout(f"Unknown character(s): {_unknown}", kind="danger")]),
     )
 
-    _ids = (
-        [_bos] + [_c2i[c] for c in expl_prompt.value]
-        if expl_prompt.value
-        else [_bos]
-    )
-    _probs = next_probs(
-        _st["params"], _ids, _H, _B, expl_temp.value * 0.1
-    )
+    _ids = ([_bos] + [_c2i[c] for c in expl_prompt.value] if expl_prompt.value else [_bos])
+    _probs = next_probs(_st["params"], _ids, _H, _B, expl_temp.value * 0.1)
     _order = np.argsort(_probs)[::-1][:min(12, _vocab)]
 
-    mo.md(
-        "### Next-character prediction\n\n"
-        + "\n".join(
-            f"`{_i2c.get(int(i), '<BOS>')}` — **{_probs[i]:.3f}**"
-            for i in _order
-        )
-    )
+    mo.vstack([
+        _playground,
+        mo.md(
+            "### Next-character prediction\n\n"
+            + "\n".join(
+                f"`{display_token(int(i), _i2c, _bos)}` — **{_probs[i]:.3f}**"
+                for i in _order
+            )
+        ),
+    ])
+
 
 
 @app.cell
 def _(
-    explain_forward, expl_head, expl_layer, expl_pos, expl_prompt, expl_temp,
-    get_st, mo, np
+    display_token, explain_forward, expl_head, expl_layer, expl_pos,
+    expl_prompt, expl_temp, get_st, mo, np
 ):
     _st = get_st()
 
@@ -512,10 +522,7 @@ def _(
     _head = min(expl_head.value - 1, _H - 1)
     _pos = min(expl_pos.value - 1, _T - 1)
 
-    _tokens = [
-        "<BOS>" if i == _bos else _i2c.get(i, "?")
-        for i in _tr["ids"]
-    ]
+    _tokens = [display_token(i, _i2c, _bos) for i in _tr["ids"]]
 
     _row = _tr["layers"][_layer]["attn"][_head, _pos]
     _top = np.argsort(_row)[::-1][:min(5, _T)]
@@ -539,7 +546,7 @@ def _(
 
     _out = np.argsort(_tr["probs"])[::-1][:min(8, _vocab)]
     _output_text = "\n".join(
-        f"`{_i2c.get(int(i), '<BOS>')}`  **{_tr['probs'][i]:.3f}**"
+        f"`{display_token(int(i), _i2c, _bos)}`  **{_tr['probs'][i]:.3f}**"
         for i in _out
     )
 
@@ -582,8 +589,8 @@ final representation → logits → softmax → next character
 
 @app.cell
 def _(
-    explain_forward, expl_head, expl_layer, expl_prompt, expl_temp,
-    get_st, mo, plt
+    display_token, explain_forward, expl_head, expl_layer, expl_prompt,
+    expl_temp, get_st, mo, plt
 ):
     _st = get_st()
 
@@ -608,10 +615,7 @@ def _(
     _layer = min(expl_layer.value - 1, _L - 1)
     _head = min(expl_head.value - 1, _H - 1)
     _attn = _tr["layers"][_layer]["attn"][_head]
-    _tokens = [
-        "BOS" if i == _bos else _i2c.get(i, "?")
-        for i in _tr["ids"]
-    ]
+    _tokens = [display_token(i, _i2c, _bos) for i in _tr["ids"]]
 
     _fig, _ax = plt.subplots(
         figsize=(max(5, len(_tokens) * 0.55),
@@ -632,7 +636,7 @@ def _(
 
 
 @app.cell
-def _(explain_forward, expl_prompt, expl_temp, get_st, mo, plt):
+def _(display_token, explain_forward, expl_prompt, expl_temp, get_st, mo, plt):
     _st = get_st()
 
     mo.stop(
@@ -653,10 +657,7 @@ def _(explain_forward, expl_prompt, expl_temp, get_st, mo, plt):
     _tr = explain_forward(
         _st["params"], _ids, _H, _B, expl_temp.value * 0.1
     )
-    _tokens = [
-        "BOS" if i == _bos else _i2c.get(i, "?")
-        for i in _tr["ids"]
-    ]
+    _tokens = [display_token(i, _i2c, _bos) for i in _tr["ids"]]
 
     _fig, _ax = plt.subplots(
         figsize=(10, max(2.5, len(_tokens) * 0.42))
